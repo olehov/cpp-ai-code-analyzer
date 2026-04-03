@@ -1,25 +1,81 @@
+#include <cerrno>
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #ifdef __unix__
 #include <spawn.h>
 #include <sys/wait.h>
+#include <unistd.h>
 #endif
+#include <sstream>
 #include <system_error>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "AiReportReader.hpp"
 #include "Analyzer.hpp"
+#include "JsonWriter.hpp"
 
 #ifdef __unix__
 extern "C" char** environ;
 #endif
 
 namespace {
+constexpr char kPathListSeparator =
+#ifdef _WIN32
+    ';';
+#else
+    ':';
+#endif
+
+std::filesystem::path findExecutableOnPath(const char* argv0) {
+    if (argv0 == nullptr) {
+        return {};
+    }
+
+    const std::string executableName(argv0);
+    if (executableName.find('/') != std::string::npos) {
+        return {};
+    }
+
+    const char* pathEnvironment = std::getenv("PATH");
+    if (pathEnvironment == nullptr) {
+        return {};
+    }
+
+    std::stringstream pathStream(pathEnvironment);
+    std::string candidateDirectory;
+    while (std::getline(pathStream, candidateDirectory, kPathListSeparator)) {
+        const std::filesystem::path candidatePath =
+            std::filesystem::path(candidateDirectory) / executableName;
+        if (std::filesystem::exists(candidatePath) && std::filesystem::is_regular_file(candidatePath)) {
+            return std::filesystem::absolute(candidatePath);
+        }
+    }
+
+    return {};
+}
+
+std::filesystem::path resolveExecutablePath(std::string_view executable) {
+    if (executable.empty()) {
+        return {};
+    }
+
+    const std::filesystem::path executablePath(executable);
+    if (executablePath.is_absolute()) {
+        return executablePath;
+    }
+
+    if (executablePath.has_parent_path()) {
+        return std::filesystem::absolute(executablePath);
+    }
+
+    return findExecutableOnPath(executable.data());
+}
+
 std::filesystem::path getExecutableDirectory(const char* argv0) {
     try {
         const std::filesystem::path procSelfExe("/proc/self/exe");
@@ -30,27 +86,89 @@ std::filesystem::path getExecutableDirectory(const char* argv0) {
     }
 
     if (argv0 != nullptr) {
+        if (const std::filesystem::path pathFromEnvironment = findExecutableOnPath(argv0);
+            !pathFromEnvironment.empty()) {
+            return pathFromEnvironment.parent_path();
+        }
         return std::filesystem::absolute(argv0).parent_path();
     }
 
     return std::filesystem::current_path();
 }
 
+bool looksLikeProjectRoot(const std::filesystem::path& path) {
+    return std::filesystem::exists(path / "cpp") && std::filesystem::exists(path / "python") &&
+           std::filesystem::exists(path / "config");
+}
+
 std::filesystem::path getProjectRoot(const char* argv0) {
+    if (const char* rootFromEnv = std::getenv("ANALYZER_ROOT")) {
+        const std::filesystem::path configuredRoot(rootFromEnv);
+        if (!configuredRoot.empty()) {
+            return std::filesystem::weakly_canonical(configuredRoot);
+        }
+    }
+
+    std::filesystem::path currentPath = getExecutableDirectory(argv0);
+
+    while (!currentPath.empty()) {
+        if (looksLikeProjectRoot(currentPath)) {
+            return currentPath;
+        }
+
+        const std::filesystem::path parentPath = currentPath.parent_path();
+        if (parentPath == currentPath) {
+            break;
+        }
+        currentPath = parentPath;
+    }
+
     return getExecutableDirectory(argv0);
 }
 
 std::filesystem::path resolvePythonExecutable(const std::filesystem::path& projectRoot) {
-    const std::filesystem::path venvPython = projectRoot / "venv" / "bin" / "python";
+    const std::filesystem::path venvPython =
+#ifdef _WIN32
+        projectRoot / "venv" / "Scripts" / "python.exe";
+#else
+        projectRoot / "venv" / "bin" / "python";
+#endif
     if (std::filesystem::exists(venvPython)) {
-        return venvPython;
+        return std::filesystem::absolute(venvPython);
     }
 
     if (const char* pythonFromEnv = std::getenv("PYTHON_EXE")) {
-        return std::filesystem::path(pythonFromEnv);
+        if (const auto resolved = resolveExecutablePath(pythonFromEnv); !resolved.empty()) {
+            return resolved;
+        }
+    }
+
+    if (const auto resolved = resolveExecutablePath("python3"); !resolved.empty()) {
+        return resolved;
     }
 
     return std::filesystem::path("python3");
+}
+
+bool isExecutableFile(const std::filesystem::path& path) {
+    std::error_code errorCode;
+    if (!std::filesystem::exists(path, errorCode) ||
+        !std::filesystem::is_regular_file(path, errorCode) || errorCode) {
+        return false;
+    }
+
+#ifdef __unix__
+    const auto permissions = std::filesystem::status(path, errorCode).permissions();
+    if (errorCode) {
+        return false;
+    }
+    using std::filesystem::perms;
+    return (permissions & perms::owner_exec) != perms::none ||
+           (permissions & perms::group_exec) != perms::none ||
+           (permissions & perms::others_exec) != perms::none;
+#else
+    return true;
+#endif
 }
 
 void runPythonAnalyzer(
@@ -75,21 +193,25 @@ void runPythonAnalyzer(
         arguments.begin(),
         arguments.end(),
         std::back_inserter(argv),
-        [](const std::string& argument) {
-            return const_cast<char*>(argument.c_str());
+        [](auto& argument) -> char* {
+            return argument.data();
         }
     );
     argv.push_back(nullptr);
 
     pid_t childPid = 0;
-    const int spawnResult =
-        posix_spawnp(&childPid, argv[0], nullptr, nullptr, argv.data(), environ);
+    const int spawnResult = pythonExecutable.is_absolute()
+                                ? posix_spawn(&childPid, argv[0], nullptr, nullptr, argv.data(), environ)
+                                : posix_spawnp(&childPid, argv[0], nullptr, nullptr, argv.data(), environ);
     if (spawnResult != 0) {
         throw std::system_error(spawnResult, std::generic_category(), "posix_spawnp failed");
     }
 
     int processStatus = 0;
-    if (waitpid(childPid, &processStatus, 0) == -1) {
+    while (waitpid(childPid, &processStatus, 0) == -1) {
+        if (errno == EINTR) {
+            continue;
+        }
         throw std::runtime_error("Failed to wait for Python analyzer process.");
     }
 
@@ -144,27 +266,27 @@ int main(int argc, char *argv[]) {
             throw std::runtime_error("Python analyzer script does not exist: " + scriptPath.string());
         }
 
-        if (pythonExecutable.is_absolute() && !std::filesystem::exists(pythonExecutable)) {
-            throw std::runtime_error(
-                "Python executable does not exist: " + pythonExecutable.string()
-            );
+        if (pythonExecutable.is_absolute() && !isExecutableFile(pythonExecutable)) {
+            throw std::runtime_error("Python executable is not runnable: " +
+                                     pythonExecutable.string());
         }
 
-        Analyzer analyzer{inputPath};
+        analysis::Analyzer analyzer{inputPath};
         analyzer.run();
-        const std::string json = analyzer.toJson();
+
+        for (const auto& diagnostic : analyzer.getDiagnostics()) {
+            std::cerr << "Warning: " << diagnostic << '\n';
+        }
 
         std::filesystem::create_directories(outputDirectory);
-
-        {
-            std::ofstream outputFile;
-            outputFile.exceptions(std::ofstream::failbit | std::ofstream::badbit);
-            outputFile.open(analysisPath);
-            outputFile << json;
-        }
+        analysis::json::write(
+            analysisPath,
+            std::filesystem::absolute(inputPath),
+            analyzer.getAnalysis()
+        );
 
         std::cout << "Project JSON saved to: " << analysisPath.string() << '\n';
-        std::cout << "Waiting for AI response..." << std::endl;
+        std::cout << "Waiting for AI responses (live progress below)..." << std::endl;
         runPythonAnalyzer(
             pythonExecutable,
             scriptPath,
@@ -173,7 +295,8 @@ int main(int argc, char *argv[]) {
             configPath
         );
         std::cout << "AI analysis saved to: " << geminiOutputPath.string() << '\n';
-        if (!AiReportReader::printConsoleReport(geminiOutputPath, std::cout)) {
+        if (!analysis::ai_report::printConsoleReport(geminiOutputPath, std::cout)) {
+            std::cerr << "Failed to print AI console report.\n";
             return 1;
         }
     } catch (const std::exception& error) {

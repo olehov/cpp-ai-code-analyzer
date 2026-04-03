@@ -1,51 +1,71 @@
 #include "Analyzer.hpp"
-#include "JsonWriter.hpp"
 #include "ProjectParser.hpp"
 
 #include <algorithm>
-#include <array>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace {
-const std::array<std::filesystem::path, 8> kSupportedExtensions = {
+const std::unordered_set<std::filesystem::path> kSupportedExtensions = {
     ".h", ".hh", ".hpp", ".hxx", ".c", ".cc", ".cpp", ".cxx"
 };
 
-const std::array<std::filesystem::path, 8> kSkippedDirectories = {
+const std::unordered_set<std::filesystem::path> kSkippedDirectories = {
     ".git", ".idea", ".vscode", "build", "cmake-build-debug", "cmake-build-release", "venv",
     "__pycache__"
 };
+
+bool isSupportedSourceFile(const std::filesystem::path& path) {
+    return kSupportedExtensions.contains(path.extension());
 }
 
-Analyzer::Analyzer(const std::filesystem::path& path) : rootPath_(std::filesystem::absolute(path)) {
+bool shouldSkipDirectory(const std::filesystem::path& path) {
+    return kSkippedDirectories.contains(path.filename());
+}
 }
 
-void Analyzer::run() {
-    paths_.clear();
-    analysis_.clear();
-    collectProjectFiles();
-    analyzeFiles();
-}
-
-const std::vector<analysis::FileAnalysis>& Analyzer::getAnalysis() const noexcept {
-    return analysis_;
-}
-
-void Analyzer::collectProjectFiles() {
-    const std::filesystem::path root(rootPath_);
-
-    if (!std::filesystem::exists(root)) {
-        throw std::runtime_error("Path does not exist: " + rootPath_.string());
-    }
-
-    if (std::filesystem::is_regular_file(root)) {
-        if (isSupportedSourceFile(root)) {
-            paths_.push_back(root);
-        }
-        return;
+namespace analysis {
+Analyzer::Analyzer(const std::filesystem::path& path) {
+    if (path.empty()) {
+        throw std::runtime_error("Analyzer input path must not be empty.");
     }
 
     std::error_code errorCode;
+    rootPath_ = std::filesystem::weakly_canonical(path, errorCode);
+    if (errorCode) {
+        throw std::runtime_error("Failed to resolve analyzer path: " + errorCode.message());
+    }
+    if (!std::filesystem::exists(rootPath_, errorCode) || errorCode) {
+        throw std::runtime_error("Path does not exist: " + rootPath_.string());
+    }
+}
+
+void Analyzer::run() {
+    analysis_.clear();
+    diagnostics_.clear();
+    analyzeFiles(collectProjectFiles());
+}
+
+std::span<const FileAnalysis> Analyzer::getAnalysis() const noexcept {
+    return analysis_;
+}
+
+std::span<const std::string> Analyzer::getDiagnostics() const noexcept {
+    return diagnostics_;
+}
+
+std::vector<std::filesystem::path> Analyzer::collectProjectFiles() {
+    std::vector<std::filesystem::path> paths;
+    const std::filesystem::path& root = rootPath_;
+    std::error_code errorCode;
+
+    if (std::filesystem::is_regular_file(root, errorCode)) {
+        if (isSupportedSourceFile(root)) {
+            paths.push_back(root);
+        }
+        return paths;
+    }
+
     const auto options = std::filesystem::directory_options::skip_permission_denied;
     std::filesystem::recursive_directory_iterator iterator(root, options, errorCode);
     const std::filesystem::recursive_directory_iterator end;
@@ -57,52 +77,51 @@ void Analyzer::collectProjectFiles() {
     }
 
     while (iterator != end) {
-        const auto entryPath = iterator->path();
+        const auto& entry = *iterator;
+        const auto entryPath = entry.path();
 
-        if (iterator->is_directory(errorCode)) {
+        if (entry.is_directory(errorCode)) {
             if (!errorCode && shouldSkipDirectory(entryPath)) {
                 iterator.disable_recursion_pending();
             }
-        } else if (!errorCode && iterator->is_regular_file(errorCode) &&
-                   isSupportedSourceFile(entryPath)) {
-            paths_.push_back(entryPath);
+        } else if (!errorCode && entry.is_regular_file(errorCode) && isSupportedSourceFile(entryPath)) {
+            paths.push_back(entryPath);
+        }
+
+        if (errorCode) {
+            diagnostics_.push_back(
+                "Filesystem metadata failed at " + entryPath.string() + ": " + errorCode.message()
+            );
         }
 
         errorCode.clear();
         iterator.increment(errorCode);
         if (errorCode) {
-            errorCode.clear();
+            diagnostics_.push_back(
+                "Unable to continue directory traversal after " + entryPath.string() + ": " +
+                errorCode.message()
+            );
+            break;
         }
     }
 
-    std::sort(paths_.begin(), paths_.end());
+    std::sort(paths.begin(), paths.end());
+    return paths;
 }
 
-void Analyzer::analyzeFiles() {
-    analysis_.clear();
-    analysis_.reserve(paths_.size());
-    std::transform(
-        paths_.begin(),
-        paths_.end(),
-        std::back_inserter(analysis_),
-        [](const auto& path) { return ProjectParser::analyzeFile(path); }
-    );
-    paths_.clear();
-    paths_.shrink_to_fit();
-}
+void Analyzer::analyzeFiles(const std::vector<std::filesystem::path>& paths) {
+    analysis_.reserve(paths.size());
+    for (const auto& path : paths) {
+        try {
+            analysis_.push_back(project_parser::analyzeFile(path));
+        } catch (const std::exception& error) {
+            diagnostics_.push_back("Failed to parse " + path.string() + ": " + error.what());
 
-bool Analyzer::isSupportedSourceFile(const std::filesystem::path& path) {
-    const auto extension = path.extension();
-    return std::find(kSupportedExtensions.begin(), kSupportedExtensions.end(), extension) !=
-           kSupportedExtensions.end();
+            FileAnalysis failedAnalysis;
+            failedAnalysis.filePath = path;
+            failedAnalysis.parseError = error.what();
+            analysis_.push_back(std::move(failedAnalysis));
+        }
+    }
 }
-
-bool Analyzer::shouldSkipDirectory(const std::filesystem::path& path) {
-    const auto directoryName = path.filename();
-    return std::find(kSkippedDirectories.begin(), kSkippedDirectories.end(), directoryName) !=
-           kSkippedDirectories.end();
-}
-
-std::string Analyzer::toJson() const {
-    return JsonWriter::write(rootPath_, getAnalysis());
 }

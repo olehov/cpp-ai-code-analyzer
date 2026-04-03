@@ -15,6 +15,7 @@ enum class ParserState {
     multiLineComment,
     stringLiteral,
     charLiteral,
+    rawStringLiteral,
 };
 
 bool startsWith(std::string_view value, std::string_view prefix) {
@@ -31,8 +32,21 @@ std::string_view trimView(std::string_view value) {
     return value.substr(begin, end - begin + 1);
 }
 
+std::string_view accessSpecifierKeyword(std::string_view value) {
+    value = trimView(value);
+    for (const std::string_view keyword : {"public", "private", "protected"}) {
+        if (startsWith(value, keyword)) {
+            const std::string_view suffix = trimView(value.substr(keyword.size()));
+            if (suffix == ":") {
+                return keyword;
+            }
+        }
+    }
+    return {};
+}
+
 bool isAccessSpecifier(std::string_view value) {
-    return value == "public:" || value == "private:" || value == "protected:";
+    return !accessSpecifierKeyword(value).empty();
 }
 
 bool isFilteredStatement(std::string_view statement) {
@@ -45,7 +59,7 @@ bool isFilteredStatement(std::string_view statement) {
            startsWith(statement, "while(") || startsWith(statement, "switch ") ||
            startsWith(statement, "switch(") || startsWith(statement, "return ") ||
            startsWith(statement, "catch ") || startsWith(statement, "else") ||
-           statement.find('#') != std::string_view::npos;
+           startsWith(statement, "#");
 }
 
 bool looksLikeMethodDeclaration(std::string_view statement) {
@@ -58,6 +72,15 @@ bool looksLikeMethodDeclaration(std::string_view statement) {
 
     if (statement.find("(*") != std::string_view::npos ||
         statement.find("(&") != std::string_view::npos) {
+        return false;
+    }
+
+    std::string_view suffix = trimView(statement.substr(closeParen + 1));
+    if (!suffix.empty() && suffix != ";" && suffix != "{" && suffix != "= default;" &&
+        suffix != "= delete;" && suffix != "= 0;" && !startsWith(suffix, "const") &&
+        !startsWith(suffix, "noexcept") && !startsWith(suffix, "override") &&
+        !startsWith(suffix, "final") && !startsWith(suffix, "requires") &&
+        !startsWith(suffix, "->") && !startsWith(suffix, "&") && !startsWith(suffix, "&&")) {
         return false;
     }
 
@@ -93,72 +116,144 @@ bool looksLikeMethodDeclaration(std::string_view statement) {
     const unsigned char firstCharacter = static_cast<unsigned char>(name.front());
     return std::isalpha(firstCharacter) != 0 || name.front() == '_' || name.front() == '~';
 }
+
+bool isEnumClassMatch(std::string_view content, std::size_t matchStart) {
+    const std::string_view prefix = trimView(content.substr(0, matchStart));
+    return prefix.size() >= 4 && prefix.substr(prefix.size() - 4) == "enum";
 }
 
-analysis::FileAnalysis ProjectParser::analyzeFile(const std::filesystem::path& path) {
-    const std::string content = readFile(path);
-    const std::string sanitized = stripComments(content);
+bool tryParseRawStringStart(
+    std::string_view content,
+    std::size_t position,
+    std::string& terminator
+) {
+    if (position + 2 >= content.size() || content[position] != 'R' || content[position + 1] != '"') {
+        return false;
+    }
 
-    analysis::FileAnalysis result;
-    result.filePath = path;
-    result.headers = parseHeaders(sanitized);
-    result.classes = parseClasses(sanitized);
-    return result;
+    const std::size_t delimiterStart = position + 2;
+    const std::size_t openParen = content.find('(', delimiterStart);
+    if (openParen == std::string_view::npos) {
+        return false;
+    }
+
+    const std::string_view delimiter = content.substr(delimiterStart, openParen - delimiterStart);
+    if (delimiter.size() > 16 ||
+        delimiter.find_first_of(" \t\r\n()\\") != std::string_view::npos) {
+        return false;
+    }
+
+    terminator.clear();
+    terminator.reserve(delimiter.size() + 2);
+    terminator.push_back(')');
+    terminator.append(delimiter);
+    terminator.push_back('"');
+    return true;
+}
 }
 
-std::string ProjectParser::readFile(const std::filesystem::path& path) {
+namespace {
+std::size_t findMatchingBrace(std::string_view content, std::size_t openBracePos) noexcept;
+std::vector<std::string> parsePublicMethods(std::string_view classBody, bool publicByDefault);
+
+std::string readFile(const std::filesystem::path& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {
         throw std::runtime_error("Unable to open file: " + path.string());
     }
 
-    file.seekg(0, std::ios::end);
-    const auto endPosition = file.tellg();
-    if (endPosition < 0) {
-        throw std::runtime_error("Unable to determine file size: " + path.string());
+    std::error_code errorCode;
+    const auto fileSize = std::filesystem::file_size(path, errorCode);
+    if (!errorCode) {
+        std::string content(static_cast<std::size_t>(fileSize), '\0');
+        if (!content.empty()) {
+            const auto bytesToRead = static_cast<std::streamsize>(content.size());
+            file.read(content.data(), bytesToRead);
+            if (file.gcount() != bytesToRead) {
+                throw std::runtime_error("Unable to read file contents: " + path.string());
+            }
+        }
+        if (!file && !file.eof()) {
+            throw std::runtime_error("Unable to read file contents: " + path.string());
+        }
+        return content;
     }
 
-    std::string content(static_cast<std::size_t>(endPosition), '\0');
-    file.seekg(0, std::ios::beg);
-
-    if (!content.empty()) {
-        file.read(content.data(), static_cast<std::streamsize>(content.size()));
+    std::string content{
+        std::istreambuf_iterator<char>(file),
+        std::istreambuf_iterator<char>()
+    };
+    if (file.bad()) {
+        throw std::runtime_error("Unable to read file contents: " + path.string());
     }
 
     return content;
 }
 
-std::vector<std::string> ProjectParser::parseHeaders(const std::string& content) {
+std::vector<std::string> parseHeaders(std::string_view content) {
     std::vector<std::string> headers;
-    const std::regex includeRegex(
-        R"(^\s*#\s*include\s*[<"]([^>"]+)[>"])",
-        std::regex::ECMAScript | std::regex::multiline
-    );
+    std::size_t lineStart = 0;
 
-    auto begin = std::sregex_iterator(content.begin(), content.end(), includeRegex);
-    auto end = std::sregex_iterator();
+    while (lineStart <= content.size()) {
+        const std::size_t lineEnd = content.find('\n', lineStart);
+        const std::size_t lineLength =
+            (lineEnd == std::string_view::npos ? content.size() : lineEnd) - lineStart;
+        std::string_view line = trimView(content.substr(lineStart, lineLength));
 
-    for (auto it = begin; it != end; ++it) {
-        headers.push_back((*it)[1].str());
+        if (startsWith(line, "#")) {
+            line.remove_prefix(1);
+            line = trimView(line);
+            if (startsWith(line, "include")) {
+                line.remove_prefix(std::string_view("include").size());
+                line = trimView(line);
+
+                if (line.size() >= 2) {
+                    const char opening = line.front();
+                    const char closing = opening == '<' ? '>' : (opening == '"' ? '"' : '\0');
+                    if (closing != '\0') {
+                        const std::size_t closePosition = line.find(closing, 1);
+                        if (closePosition != std::string_view::npos) {
+                            std::string header(line.substr(1, closePosition - 1));
+                            if (std::find(headers.begin(), headers.end(), header) == headers.end()) {
+                                headers.push_back(std::move(header));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (lineEnd == std::string_view::npos) {
+            break;
+        }
+        lineStart = lineEnd + 1;
     }
 
     return headers;
 }
 
-std::vector<analysis::ClassInfo> ProjectParser::parseClasses(const std::string& content) {
+std::vector<analysis::ClassInfo> parseClasses(std::string_view content) {
     std::vector<analysis::ClassInfo> classes;
+    const std::string source(content);
     const std::regex classRegex(
-        R"((?:\[\[[^\]]+\]\]\s*)*\b(class|struct)\s+([A-Za-z_]\w*)[^;{]*\{)"
+        R"((?:template\s*<[^;{]*>\s*)*(?:\[\[[^\]]+\]\]\s*)*\b(class|struct)\s+([A-Za-z_]\w*)[^;{]*\{)"
     );
-    auto searchBegin = content.cbegin();
-    std::smatch match;
+    auto searchBegin = source.cbegin();
+    std::match_results<std::string::const_iterator> match;
 
-    while (std::regex_search(searchBegin, content.cend(), match, classRegex)) {
+    while (std::regex_search(searchBegin, source.cend(), match, classRegex)) {
+        const std::size_t matchStart =
+            static_cast<std::size_t>(std::distance(source.cbegin(), match[0].first));
+        if (isEnumClassMatch(content, matchStart)) {
+            searchBegin = match[0].second;
+            continue;
+        }
+
         const std::string keyword = match[1].str();
         const std::string className = match[2].str();
         const std::size_t openBracePos =
             static_cast<std::size_t>(
-                std::distance(content.cbegin(), match[0].first) + match.length(0) - 1
+                matchStart + match.length(0) - 1
             );
         const std::size_t closeBracePos = findMatchingBrace(content, openBracePos);
 
@@ -167,27 +262,27 @@ std::vector<analysis::ClassInfo> ProjectParser::parseClasses(const std::string& 
             continue;
         }
 
-        const std::string_view contentView(content);
-        const std::string_view body =
-            contentView.substr(openBracePos + 1, closeBracePos - openBracePos - 1);
+        const std::string_view body = content.substr(openBracePos + 1, closeBracePos - openBracePos - 1);
 
         analysis::ClassInfo classInfo;
         classInfo.name = className;
         classInfo.publicMethods = parsePublicMethods(body, keyword == "struct");
         classes.push_back(std::move(classInfo));
 
-        searchBegin = content.cbegin() + static_cast<std::ptrdiff_t>(closeBracePos + 1);
+        searchBegin = match[0].second;
     }
 
     return classes;
 }
 
-std::string ProjectParser::stripComments(const std::string& content) {
+std::string stripComments(const std::string& content) {
     std::string result;
     result.reserve(content.size());
 
     ParserState state = ParserState::code;
     bool escaped = false;
+    std::string rawStringTerminator;
+    std::size_t rawStringMatchIndex = 0;
 
     for (std::size_t i = 0; i < content.size(); ++i) {
         const char current = content[i];
@@ -201,6 +296,10 @@ std::string ProjectParser::stripComments(const std::string& content) {
                 } else if (current == '/' && next == '*') {
                     state = ParserState::multiLineComment;
                     ++i;
+                } else if (tryParseRawStringStart(content, i, rawStringTerminator)) {
+                    state = ParserState::rawStringLiteral;
+                    rawStringMatchIndex = 0;
+                    result.push_back(current);
                 } else {
                     result.push_back(current);
                     if (current == '"') {
@@ -248,23 +347,68 @@ std::string ProjectParser::stripComments(const std::string& content) {
                     state = ParserState::code;
                 }
                 break;
+
+            case ParserState::rawStringLiteral:
+                result.push_back(current);
+                if (current == rawStringTerminator[rawStringMatchIndex]) {
+                    ++rawStringMatchIndex;
+                    if (rawStringMatchIndex == rawStringTerminator.size()) {
+                        rawStringMatchIndex = 0;
+                        rawStringTerminator.clear();
+                        state = ParserState::code;
+                    }
+                } else if (current == rawStringTerminator[0]) {
+                    rawStringMatchIndex = 1;
+                } else {
+                    rawStringMatchIndex = 0;
+                }
+                break;
+        }
+
+        if (state == ParserState::code && current == '\\' && next == '\n') {
+            result.push_back(next);
+            ++i;
         }
     }
 
     return result;
 }
 
-std::size_t ProjectParser::findMatchingBrace(
-    const std::string& content,
+std::size_t findMatchingBrace(
+    std::string_view content,
     std::size_t openBracePos
-) {
+) noexcept {
     int depth = 0;
     bool inString = false;
     bool inChar = false;
     bool escaped = false;
+    bool inRawString = false;
+    std::string rawStringTerminator;
+    std::size_t rawStringMatchIndex = 0;
 
     for (std::size_t i = openBracePos; i < content.size(); ++i) {
         const char current = content[i];
+
+        if (!inString && !inChar && !inRawString && tryParseRawStringStart(content, i, rawStringTerminator)) {
+            inRawString = true;
+            rawStringMatchIndex = 0;
+        }
+
+        if (inRawString) {
+            if (current == rawStringTerminator[rawStringMatchIndex]) {
+                ++rawStringMatchIndex;
+                if (rawStringMatchIndex == rawStringTerminator.size()) {
+                    inRawString = false;
+                    rawStringMatchIndex = 0;
+                    rawStringTerminator.clear();
+                }
+            } else if (current == rawStringTerminator[0]) {
+                rawStringMatchIndex = 1;
+            } else {
+                rawStringMatchIndex = 0;
+            }
+            continue;
+        }
 
         if (escaped) {
             escaped = false;
@@ -303,7 +447,7 @@ std::size_t ProjectParser::findMatchingBrace(
     return std::string::npos;
 }
 
-std::vector<std::string> ProjectParser::parsePublicMethods(
+std::vector<std::string> parsePublicMethods(
     std::string_view classBody,
     bool publicByDefault
 ) {
@@ -348,8 +492,9 @@ std::vector<std::string> ProjectParser::parsePublicMethods(
 
         if (nestedBraceDepth == 0) {
             const std::string_view trimmed = trimView(currentStatement);
-            if (isAccessSpecifier(trimmed)) {
-                accessLevel = std::string(trimmed.substr(0, trimmed.find(':')));
+            if (const std::string_view keyword = accessSpecifierKeyword(trimmed);
+                !keyword.empty()) {
+                accessLevel = std::string(keyword);
                 currentStatement.clear();
             }
         }
@@ -357,7 +502,17 @@ std::vector<std::string> ProjectParser::parsePublicMethods(
 
     return methods;
 }
+}
 
-std::string_view ProjectParser::trim(std::string_view value) {
-    return trimView(value);
+namespace analysis::project_parser {
+FileAnalysis analyzeFile(const std::filesystem::path& path) {
+    const std::string content = readFile(path);
+    const std::string sanitized = stripComments(content);
+
+    FileAnalysis result;
+    result.filePath = path;
+    result.headers = parseHeaders(sanitized);
+    result.classes = parseClasses(sanitized);
+    return result;
+}
 }

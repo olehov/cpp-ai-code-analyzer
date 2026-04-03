@@ -1,5 +1,6 @@
 #include "JsonWriter.hpp"
 
+#include <fstream>
 #include <ostream>
 #include <sstream>
 #include <string_view>
@@ -51,22 +52,24 @@ void writeQuotedEscaped(std::ostream& output, std::string_view value) {
 }
 }
 
-std::string JsonWriter::write(
+namespace analysis::json {
+std::string write(
     const std::filesystem::path& rootPath,
-    const std::vector<analysis::FileAnalysis>& analysis
+    std::span<const FileAnalysis> analysis
 ) {
     std::ostringstream json;
     write(json, rootPath, analysis);
     return json.str();
 }
 
-void JsonWriter::write(
+void write(
     std::ostream& output,
     const std::filesystem::path& rootPath,
-    const std::vector<analysis::FileAnalysis>& analysis
+    std::span<const FileAnalysis> analysis
 ) {
     output << "{\n  \"root\": ";
-    writeQuotedEscaped(output, rootPath.generic_string());
+    const std::string rootPathString = rootPath.generic_string();
+    writeQuotedEscaped(output, rootPathString);
     output << ",\n  \"files\": [\n";
 
     bool firstFile = true;
@@ -78,7 +81,8 @@ void JsonWriter::write(
 
         output << "    {\n";
         output << "      \"path\": ";
-        writeQuotedEscaped(output, file.filePath.generic_string());
+        const std::string filePathString = file.filePath.generic_string();
+        writeQuotedEscaped(output, filePathString);
         output << ",\n";
         output << "      \"headers\": [";
 
@@ -120,9 +124,24 @@ void JsonWriter::write(
             output << "        }";
         }
 
-        output << "\n      ]\n";
+        output << "\n      ],\n";
+        output << "      \"parse_error\": ";
+        writeQuotedEscaped(output, file.parseError);
+        output << '\n';
         output << "    }";
     }
 
     output << "\n  ]\n}\n";
+}
+
+void write(
+    const std::filesystem::path& destination,
+    const std::filesystem::path& rootPath,
+    std::span<const FileAnalysis> analysis
+) {
+    std::ofstream outputFile;
+    outputFile.exceptions(std::ofstream::failbit | std::ofstream::badbit);
+    outputFile.open(destination);
+    write(outputFile, rootPath, analysis);
+}
 }

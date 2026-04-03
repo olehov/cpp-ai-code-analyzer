@@ -36,6 +36,7 @@ struct FileAnalysis {
     std::filesystem::path filePath; ///< Absolute or project-relative path to the analyzed file.
     std::vector<std::string> headers; ///< Header names extracted from `#include` directives.
     std::vector<ClassInfo> classes; ///< Parsed classes and structs discovered in the file.
+    std::string parseError; ///< Non-empty when the file could not be parsed completely.
 
     /**
      * @brief Compares two file-level analysis results.

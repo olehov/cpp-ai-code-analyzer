@@ -1,0 +1,26 @@
+# Build artifacts
+/analyzer
+/build/
+/tmp/
+
+# Python environment and caches
+/venv/
+/.venv/
+__pycache__/
+*.py[cod]
+
+# Local configuration with secrets
+/config/ai_config.json
+
+# Editor and OS files
+/.codex
+/.idea/
+/.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Optional tooling outputs
+/compile_commands.json
+/docs/html/
+/docs/latex/

@@ -17,6 +17,11 @@ The project is split into two stages:
 - JSON export of project structure
 - Safe Python process launch from C++ with `posix_spawnp`
 - Retry / backoff for temporary AI API failures
+- AI request throttling to respect API request-per-minute limits
+- Parallel AI request processing with bounded worker threads
+- Cached AI results reuse for unchanged files
+- Cooldown between full AI request waves to avoid accidental overuse
+- Incremental JSON report updates and live console progress
 - Colorized console report for AI results
 
 ## Project Structure
@@ -82,12 +87,24 @@ Useful Make targets:
 - `make fclean` - remove object files and the binary
 - `make re` - rebuild from scratch
 
+## AI Runtime Controls
+
+The Python AI runner supports basic quota protection through `config/ai_config.json`:
+
+- `max_requests_per_minute` - caps how many Gemini requests can be sent per minute
+- `max_concurrent_requests` - limits how many AI requests can be processed in parallel
+- `min_run_interval_seconds` - prevents fresh AI requests from being sent too often across consecutive runs
+- `max_retries` / `initial_backoff_seconds` / `backoff_multiplier` / `max_backoff_seconds` - configure retry behavior for temporary API failures
+
+When possible, the runner reuses cached AI results for unchanged files instead of sending a new request. While AI requests are running, the Python stage prints live progress and updates `tmp/gemini_analysis.json` incrementally as each file finishes.
+
 ## Output
 
 Generated files are written to `tmp/`:
 
 - `tmp/analysis.json` - structural project analysis from the C++ stage
 - `tmp/gemini_analysis.json` - AI review results from the Python stage
+- `tmp/ai_run_state.json` - internal cooldown state for the AI runner
 
 ## Notes
 

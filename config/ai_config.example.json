@@ -1,6 +1,9 @@
 {
   "gemini_api_key": "paste-your-gemini-api-key-here",
   "model": "gemini-2.5-flash",
+  "max_requests_per_minute": 15,
+  "max_concurrent_requests": 3,
+  "min_run_interval_seconds": 120,
   "max_retries": 3,
   "initial_backoff_seconds": 2.0,
   "backoff_multiplier": 2.0,
